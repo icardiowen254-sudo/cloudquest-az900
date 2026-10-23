@@ -7,7 +7,11 @@ import Dashboard from './pages/Dashboard';
 import ForgotPassword from './pages/ForgotPassword';
 import Login from './pages/Login';
 import Onboarding from './pages/Onboarding';
+import Flashcards from './pages/Flashcards';
 import QuizHome from './pages/QuizHome';
+import Readiness from './pages/Readiness';
+import StudyPlan from './pages/StudyPlan';
+import Tutor from './pages/Tutor';
 import QuizResults from './pages/QuizResults';
 import QuizRun from './pages/QuizRun';
 import Register from './pages/Register';
@@ -36,6 +40,10 @@ export default function App() {
           <Route element={<AppShell />}>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/quiz" element={<QuizHome />} />
+            <Route path="/flashcards" element={<Flashcards />} />
+            <Route path="/plan" element={<StudyPlan />} />
+            <Route path="/readiness" element={<Readiness />} />
+            <Route path="/tutor" element={<Tutor />} />
             <Route path="/quiz/:attemptId" element={<QuizRun />} />
             <Route path="/quiz/:attemptId/results" element={<QuizResults />} />
             <Route path="/settings" element={<SettingsPage />} />

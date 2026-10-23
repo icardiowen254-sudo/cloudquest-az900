@@ -44,5 +44,7 @@ ${list}
 export const BUNDLE_SOURCES = [
   'supabase/migrations/0001_schema.sql',
   'supabase/migrations/0002_quiz.sql',
+  'supabase/migrations/0003_stage3.sql',
   'supabase/seed/0001_questions.sql',
+  'supabase/seed/0002_flashcards.sql',
 ] as const;

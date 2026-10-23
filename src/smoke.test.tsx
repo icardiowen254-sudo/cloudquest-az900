@@ -105,8 +105,21 @@ describe('screens render', () => {
     const html = render(<AppShell />);
     expect(html).toContain('Dashboard');
     expect(html).toContain('Quizzes');
+    expect(html).toContain('Flashcards');
+    expect(html).toContain('Readiness');
+    expect(html).toContain('Tutor');
     expect(html).toContain('Settings');
     expect(html).toContain('Log out');
     expect(html).toContain(DISCLAIMER);
+  });
+  it('stage 3 screens render their loading states', async () => {
+    const { default: Flashcards } = await import('./pages/Flashcards');
+    const { default: StudyPlan } = await import('./pages/StudyPlan');
+    const { default: Readiness } = await import('./pages/Readiness');
+    const { default: Tutor } = await import('./pages/Tutor');
+    expect(render(<Flashcards />)).toContain('Loading your cards');
+    expect(render(<StudyPlan />)).toContain('Loading your plan');
+    expect(render(<Readiness />)).toContain('Calculating your readiness');
+    expect(render(<Tutor />)).toContain('Loading your conversation');
   });
 });

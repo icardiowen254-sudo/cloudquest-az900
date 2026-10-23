@@ -1,4 +1,4 @@
-import { LayoutDashboard, ListChecks, LogOut, Settings } from 'lucide-react';
+import { CalendarDays, Gauge, Layers, LayoutDashboard, ListChecks, LogOut, MessageCircle, Settings } from 'lucide-react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { DISCLAIMER } from '../lib/constants';
@@ -8,6 +8,10 @@ import { Logo } from './Logo';
 const NAV = [
   { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/quiz', label: 'Quizzes', icon: ListChecks },
+  { to: '/flashcards', label: 'Flashcards', icon: Layers },
+  { to: '/plan', label: 'Plan', icon: CalendarDays },
+  { to: '/readiness', label: 'Readiness', icon: Gauge },
+  { to: '/tutor', label: 'Tutor', icon: MessageCircle },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 

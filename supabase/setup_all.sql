@@ -5,7 +5,9 @@
 -- Paste this whole file into the Supabase SQL editor and run it ONCE on an empty project. It applies, in order:
 --   1. supabase/migrations/0001_schema.sql
 --   2. supabase/migrations/0002_quiz.sql
---   3. supabase/seed/0001_questions.sql
+--   3. supabase/migrations/0003_stage3.sql
+--   4. supabase/seed/0001_questions.sql
+--   5. supabase/seed/0002_flashcards.sql
 --
 -- Everything runs in ONE transaction. If any statement fails, nothing is applied, so you can fix the
 -- problem and run the file again. To start over after a successful run, run supabase/reset_dev.sql first.
@@ -13,7 +15,7 @@
 begin;
 
 -- ══════════════════════════════════════════════════════════════════════
--- PART 1 OF 3: supabase/migrations/0001_schema.sql
+-- PART 1 OF 5: supabase/migrations/0001_schema.sql
 -- ══════════════════════════════════════════════════════════════════════
 
 -- CloudQuest AZ-900 · migration 0001 · schema, row level security, reference data
@@ -395,7 +397,7 @@ from (values
 join public.topics t on t.slug = s.topic_slug;
 
 -- ══════════════════════════════════════════════════════════════════════
--- PART 2 OF 3: supabase/migrations/0002_quiz.sql
+-- PART 2 OF 5: supabase/migrations/0002_quiz.sql
 -- ══════════════════════════════════════════════════════════════════════
 
 -- CloudQuest AZ-900 · migration 0002 · quiz engine (server-side scoring)
@@ -846,7 +848,252 @@ grant execute on function public.get_attempt_result(uuid) to authenticated;
 grant execute on function public.get_attempt_progress(uuid) to authenticated;
 
 -- ══════════════════════════════════════════════════════════════════════
--- PART 3 OF 3: supabase/seed/0001_questions.sql
+-- PART 3 OF 5: supabase/migrations/0003_stage3.sql
+-- ══════════════════════════════════════════════════════════════════════
+
+-- CloudQuest AZ-900 · migration 0003 · flashcard scheduling, study plans, tutor usage limits
+--
+-- Learners never write to these tables directly. Each change goes through a function below,
+-- so rules (rating values, valid plans, daily limits) are enforced on the server.
+
+
+-- ── Flashcard review queue ───────────────────────────────────────────────
+-- Due cards first, then new cards. Runs as the caller, so RLS limits it to their own progress.
+create function public.get_review_queue(p_limit integer default 20)
+returns table (
+  flashcard_id   uuid,
+  topic_title    text,
+  subtopic_title text,
+  front          text,
+  back           text,
+  example        text,
+  reference_url  text,
+  is_new         boolean,
+  due_at         timestamptz,
+  repetitions    integer
+)
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select f.id,
+         t.title,
+         s.title,
+         f.front,
+         f.back,
+         f.example,
+         f.reference_url,
+         st.flashcard_id is null,
+         coalesce(st.due_at, now()),
+         coalesce(st.repetitions, 0)
+    from public.flashcards f
+    join public.subtopics s on s.id = f.subtopic_id
+    join public.topics t on t.id = s.topic_id
+    left join public.flashcard_states st
+           on st.flashcard_id = f.id and st.user_id = (select auth.uid())
+   where f.is_published
+     and (st.flashcard_id is null or st.due_at <= now())
+   order by (st.flashcard_id is null), coalesce(st.due_at, now()), f.id
+   limit least(greatest(p_limit, 1), 100)
+$$;
+
+-- ── Flashcard scheduling (simplified SM-2) ───────────────────────────────
+-- Ratings: 0 Again, 1 Hard, 2 Good, 3 Easy.
+-- Again: forgotten. Repetitions reset, the card returns in 10 minutes, ease drops by 0.20 (minimum 1.30).
+-- Hard: ease drops by 0.15. Reviews 1 and 2 are fixed at 1 and 2 days; later intervals grow by 1.2x.
+-- Good: reviews 1 and 2 are 1 day and 3 days; later intervals grow by the ease factor.
+-- Easy: ease rises by 0.15. Reviews 1 and 2 are 4 and 6 days; later intervals grow by 1.3x the ease factor.
+create function public.review_flashcard(p_flashcard_id uuid, p_rating integer)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user     uuid := auth.uid();
+  v_ease     numeric(4,2);
+  v_interval integer;
+  v_reps     integer;
+  v_lapses   integer;
+  v_before   integer;
+  v_due      timestamptz;
+begin
+  if v_user is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+  if p_rating is null or p_rating not in (0, 1, 2, 3) then
+    raise exception 'invalid_rating' using errcode = '22023';
+  end if;
+  if not exists (select 1 from public.flashcards f where f.id = p_flashcard_id and f.is_published) then
+    raise exception 'flashcard_not_found' using errcode = 'P0002';
+  end if;
+
+  select fs.ease_factor, fs.interval_days, fs.repetitions, fs.lapses
+    into v_ease, v_interval, v_reps, v_lapses
+    from public.flashcard_states fs
+   where fs.user_id = v_user and fs.flashcard_id = p_flashcard_id;
+  if not found then
+    v_ease := 2.50; v_interval := 0; v_reps := 0; v_lapses := 0;
+  end if;
+  v_before := v_interval;
+
+  if p_rating = 0 then
+    v_reps := 0;
+    v_lapses := v_lapses + 1;
+    v_ease := greatest(1.30, v_ease - 0.20);
+    v_interval := 0;
+    v_due := now() + interval '10 minutes';
+  else
+    if p_rating = 1 then
+      v_ease := greatest(1.30, v_ease - 0.15);
+    elsif p_rating = 3 then
+      v_ease := v_ease + 0.15;
+    end if;
+    v_reps := v_reps + 1;
+    if v_reps = 1 then
+      v_interval := case p_rating when 1 then 1 when 2 then 1 else 4 end;
+    elsif v_reps = 2 then
+      v_interval := case p_rating when 1 then 2 when 2 then 3 else 6 end;
+    else
+      v_interval := greatest(1, round(v_interval * case p_rating when 1 then 1.2 when 2 then v_ease else v_ease * 1.3 end)::integer);
+    end if;
+    v_due := now() + make_interval(days => v_interval);
+  end if;
+
+  insert into public.flashcard_states as fs
+    (user_id, flashcard_id, ease_factor, interval_days, repetitions, lapses, due_at, last_reviewed_at)
+  values (v_user, p_flashcard_id, v_ease, v_interval, v_reps, v_lapses, v_due, now())
+  on conflict (user_id, flashcard_id) do update
+     set ease_factor = excluded.ease_factor,
+         interval_days = excluded.interval_days,
+         repetitions = excluded.repetitions,
+         lapses = excluded.lapses,
+         due_at = excluded.due_at,
+         last_reviewed_at = excluded.last_reviewed_at;
+
+  insert into public.flashcard_reviews (user_id, flashcard_id, rating, interval_before, interval_after)
+  values (v_user, p_flashcard_id, p_rating, v_before, v_interval);
+
+  insert into public.activity_log (user_id, kind, ref_id, meta)
+  values (v_user, 'flashcards_reviewed', p_flashcard_id, jsonb_build_object('rating', p_rating));
+
+  return jsonb_build_object('flashcard_id', p_flashcard_id, 'interval_days', v_interval,
+                            'repetitions', v_reps, 'due_at', v_due);
+end;
+$$;
+
+-- ── Study plans ──────────────────────────────────────────────────────────
+-- Stores a plan the app generated from the learner's inputs. Archives the previous active plan in the same transaction.
+create function public.save_study_plan(
+  p_exam_date date,
+  p_weekly_hours numeric,
+  p_study_days smallint[],
+  p_sessions jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user uuid := auth.uid();
+  v_plan uuid;
+begin
+  if v_user is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+  if p_exam_date is null or p_exam_date < current_date then
+    raise exception 'exam_date_in_past' using errcode = '22023';
+  end if;
+  if p_weekly_hours is null or p_weekly_hours < 1 or p_weekly_hours > 80 then
+    raise exception 'invalid_hours' using errcode = '22023';
+  end if;
+  if p_study_days is null or cardinality(p_study_days) = 0
+     or not (p_study_days <@ array[0,1,2,3,4,5,6]::smallint[]) then
+    raise exception 'invalid_study_days' using errcode = '22023';
+  end if;
+  if p_sessions is null or jsonb_typeof(p_sessions) <> 'array' or jsonb_array_length(p_sessions) > 1000 then
+    raise exception 'invalid_sessions' using errcode = '22023';
+  end if;
+  if exists (
+    select 1 from jsonb_array_elements(p_sessions) s
+     where (s ->> 'scheduled_for')::date not between current_date and p_exam_date
+        or (s ->> 'planned_minutes')::integer not between 5 and 480
+        or s ->> 'kind' not in ('learn', 'quiz', 'flashcards', 'review', 'mock')
+  ) then
+    raise exception 'invalid_session' using errcode = '22023';
+  end if;
+
+  update public.study_plans set status = 'archived' where user_id = v_user and status = 'active';
+
+  insert into public.study_plans (user_id, exam_date, weekly_hours, study_days)
+  values (v_user, p_exam_date, p_weekly_hours, p_study_days)
+  returning id into v_plan;
+
+  insert into public.study_sessions (plan_id, user_id, scheduled_for, kind, topic_id, title, planned_minutes)
+  select v_plan, v_user,
+         (s ->> 'scheduled_for')::date,
+         s ->> 'kind',
+         nullif(s ->> 'topic_id', '')::uuid,
+         left(s ->> 'title', 160),
+         (s ->> 'planned_minutes')::smallint
+    from jsonb_array_elements(p_sessions) s;
+
+  insert into public.activity_log (user_id, kind, ref_id, meta)
+  values (v_user, 'plan_generated', v_plan, jsonb_build_object('sessions', jsonb_array_length(p_sessions)));
+
+  return v_plan;
+end;
+$$;
+
+-- ── AI tutor daily limit ─────────────────────────────────────────────────
+-- Only the server-side tutor function (service role) can call this. Returns false once the limit is reached.
+create table public.ai_usage (
+  user_id     uuid not null references auth.users (id) on delete cascade,
+  usage_date  date not null default current_date,
+  messages    integer not null default 0 check (messages >= 0),
+  primary key (user_id, usage_date)
+);
+alter table public.ai_usage enable row level security;
+create policy ai_usage_select_own on public.ai_usage for select to authenticated
+  using (user_id = (select auth.uid()));
+revoke all on public.ai_usage from anon, authenticated;
+grant select on public.ai_usage to authenticated;
+
+create function public.consume_ai_message(p_user_id uuid, p_daily_limit integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_ok boolean;
+begin
+  insert into public.ai_usage as u (user_id, usage_date, messages)
+  values (p_user_id, current_date, 1)
+  on conflict (user_id, usage_date) do update set messages = u.messages + 1
+    where u.messages < p_daily_limit
+  returning true into v_ok;
+  return coalesce(v_ok, false);
+end;
+$$;
+
+-- ── Execution rights ─────────────────────────────────────────────────────
+revoke all on function public.get_review_queue(integer) from public, anon;
+grant execute on function public.get_review_queue(integer) to authenticated;
+
+revoke all on function public.review_flashcard(uuid, integer) from public, anon;
+grant execute on function public.review_flashcard(uuid, integer) to authenticated;
+
+revoke all on function public.save_study_plan(date, numeric, smallint[], jsonb) from public, anon;
+grant execute on function public.save_study_plan(date, numeric, smallint[], jsonb) to authenticated;
+
+revoke all on function public.consume_ai_message(uuid, integer) from public, anon, authenticated;
+grant execute on function public.consume_ai_message(uuid, integer) to service_role;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- PART 4 OF 5: supabase/seed/0001_questions.sql
 -- ══════════════════════════════════════════════════════════════════════
 
 -- GENERATED by scripts/build-seed.ts from content/questions.json. Do not edit by hand.
@@ -1414,5 +1661,62 @@ begin
     raise exception 'seed check failed: expected 52 published questions';
   end if;
 end $$;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- PART 5 OF 5: supabase/seed/0002_flashcards.sql
+-- ══════════════════════════════════════════════════════════════════════
+
+-- GENERATED by scripts/build-seed.ts from content/flashcards.json. Do not edit by hand.
+-- Reviewed 2026-10-20. 37 flashcards. Safe to re-run.
+
+
+insert into public.flashcards (id, subtopic_id, front, back, example, reference_url, is_published)
+select v.id::uuid, s.id, v.front, v.back, v.example, v.reference_url, true
+from (values
+  ('29f10900-c2b4-5352-ae3e-9ca981fdd835', 'cloud-computing', 'What is cloud computing?', 'Delivering computing services such as servers, storage, databases and networking over the internet, usually paid for by use.', 'Like buying electricity from the grid instead of building your own power station.', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-compute/'),
+  ('844039d8-d2cc-54fd-b54b-1dd793eb2afc', 'cloud-computing', 'What is the shared responsibility model?', 'The provider secures the physical datacentre, network and hosts. The customer remains responsible for its data, identities and, depending on the service type, the operating system and applications.', 'The landlord locks the building; you lock your own flat.', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-compute/'),
+  ('6da1a972-7954-5d65-bb31-4ea4777c5885', 'cloud-computing', 'CapEx vs OpEx in the cloud', 'CapEx is up-front spending on assets you own. OpEx is ongoing spending on services you use. Cloud usually moves spending from CapEx to OpEx.', 'Buying a generator (CapEx) vs paying for mains electricity each month (OpEx).', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-compute/'),
+  ('67fe80f8-3636-5c58-a76b-89e8fb4b336b', 'cloud-benefits', 'Scale out vs scale up', 'Scaling out (horizontal) adds more instances. Scaling up (vertical) makes one instance bigger with more CPU or memory.', 'Opening more market stalls (out) vs building a bigger stall (up).', 'https://learn.microsoft.com/en-us/training/modules/describe-benefits-use-cloud-services/'),
+  ('fa9a5c25-ca85-55df-aed1-d69d96b972a7', 'cloud-benefits', 'What makes an application highly available?', 'Removing single points of failure, for example running several instances across availability zones behind a load balancer.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-benefits-use-cloud-services/'),
+  ('fd8036fa-468e-514e-90b6-993ec7b9421e', 'cloud-benefits', 'What does cloud agility mean?', 'Provisioning resources in minutes and trying ideas without buying hardware first.', 'A shop opening a pop-up branch for a month without building one.', 'https://learn.microsoft.com/en-us/training/modules/describe-benefits-use-cloud-services/'),
+  ('77a3c118-a78e-5233-803f-89d4298352e9', 'cloud-service-types', 'IaaS in one line', 'You rent infrastructure such as virtual machines, storage and networks, and manage the operating system and everything above it.', 'Renting an empty flat: you furnish and maintain it.', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-service-types/'),
+  ('35974b62-4f15-5d63-b83b-b876ac2e3211', 'cloud-service-types', 'PaaS in one line', 'You deploy your code on a managed platform. The provider handles the servers, operating system and runtime.', 'Renting a serviced office where the desks and cleaning are included.', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-service-types/'),
+  ('9ab92473-c34b-5eb2-8f88-608173c815ec', 'cloud-service-types', 'SaaS in one line', 'You use a finished application over the internet, such as Microsoft 365, and manage only your data and users.', 'Staying in a hotel: you use the room without maintaining it.', 'https://learn.microsoft.com/en-us/training/modules/describe-cloud-service-types/'),
+  ('022c4b5c-c6ff-55f9-8069-bfa238efbe08', 'core-architecture', 'What is an Azure region?', 'A set of datacentres in a geographic area, connected by a low-latency network.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-core-architectural-components-of-azure/'),
+  ('54c2f96d-9a97-582e-b5fa-d9d7c0a4643e', 'core-architecture', 'What is an availability zone?', 'A physically separate datacentre within a region. Regions that support zones have at least three.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-core-architectural-components-of-azure/'),
+  ('b2dd5828-b817-52e1-b4ec-d6a2fec30924', 'core-architecture', 'Order the Azure management scopes from broadest to narrowest', 'Management group, then subscription, then resource group, then resource.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-core-architectural-components-of-azure/'),
+  ('35000e20-96e6-5cd9-bd9e-574017e95f18', 'core-architecture', 'What is a region pair?', 'Two regions in the same geography. Some services use pairs for geo-replication and planned updates are staggered across them. Many newer regions are not paired.', null, 'https://learn.microsoft.com/azure/reliability/regions-paired'),
+  ('a42e7778-e8eb-5ff5-92b9-50cbe1bd41c8', 'compute-networking', 'What is an Azure virtual machine?', 'IaaS compute where you manage the operating system. A Virtual Machine Scale Set manages a group of identical machines that can grow or shrink with demand.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-compute-networking-services/'),
+  ('cf0c89e6-bdfb-5862-b14e-1c0abf40e0b0', 'compute-networking', 'What is Azure Functions?', 'Serverless compute that runs code when an event triggers it. You pay for the executions, not for idle servers.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-compute-networking-services/'),
+  ('0e5ed972-ab74-5096-8972-df3c219d9d60', 'compute-networking', 'What is an Azure virtual network?', 'A private network in Azure where resources communicate. Subnets divide it, and peering connects two virtual networks.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-networking-services/'),
+  ('4ff58d0c-0981-5891-b896-44c622b81ee6', 'compute-networking', 'ExpressRoute vs VPN Gateway', 'ExpressRoute is a private connection through a connectivity provider, not over the public internet. VPN Gateway sends encrypted traffic over the internet.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-networking-services/'),
+  ('ddfb91b5-5f39-58b9-8fce-f7c901400b7b', 'storage', 'Which Azure Storage service holds large unstructured objects?', 'Blob Storage, for files such as images, video, backups and logs, accessed through URLs.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-storage-services/'),
+  ('4fbf134a-a70e-5af5-9826-da5db10956a9', 'storage', 'Blob access tiers from most to least frequently accessed', 'Hot for frequent access, Cool for infrequent, Cold for rare, and Archive for data that is offline, cheapest to store and slowest to retrieve.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-storage-services/'),
+  ('dbf909de-6d4c-5464-8900-c2e6ec5c21bd', 'storage', 'LRS, ZRS, GRS and GZRS', 'LRS keeps copies in one datacentre. ZRS spreads them across zones in one region. GRS adds a second region. GZRS combines zones with a second region.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-storage-services/'),
+  ('9a658799-9169-59ea-9766-479be03ae12d', 'identity-security', 'What is Microsoft Entra ID?', 'A cloud identity and access management service that handles sign-in, single sign-on, multifactor authentication and access to apps.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-identity-access-security/'),
+  ('8e5f3c42-d07d-5bc9-aa76-5f946426b52e', 'identity-security', 'What does Azure RBAC do?', 'Grants permissions through role assignments, each made of a who, a role and a scope.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-identity-access-security/'),
+  ('32a740d4-8605-50e5-82f9-4c82d77f5534', 'identity-security', 'What is Conditional Access?', 'Rules that evaluate sign-in signals such as location, device and risk, then allow, block or require multifactor authentication.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-identity-access-security/'),
+  ('86f3859d-2149-5f26-9817-babae192d861', 'identity-security', 'The three Zero Trust principles', 'Verify explicitly, use least-privilege access, and assume breach.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-azure-identity-access-security/'),
+  ('2c629a3d-74ee-5838-86ba-8cc5420a542c', 'cost-management', 'What is the pricing calculator for?', 'Estimating the cost of planned services, regions and sizes before you deploy them.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-cost-management-azure/'),
+  ('89ef4dc9-e424-5848-a6cb-b4f4284c2c8b', 'cost-management', 'What do budgets do in Cost Management?', 'Track spending against a limit you set and send alerts when thresholds are reached.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-cost-management-azure/'),
+  ('01a5a48c-0d3d-5fb4-a075-ab27db745d13', 'cost-management', 'Which data transfer is charged in Azure?', 'Inbound data is free. Outbound data is charged beyond a free allowance, at rates that depend on the destination.', null, 'https://azure.microsoft.com/pricing/details/bandwidth/'),
+  ('cb7d561b-1959-5ffc-93e0-e44c49da22c5', 'cost-management', 'What are tags for?', 'Name and value pairs that organise resources and group costs. They are metadata: they do not change prices or inherit automatically.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-cost-management-azure/'),
+  ('717c4c95-b7ab-5b33-a0c2-e44b3c897678', 'governance-compliance', 'What is Azure Policy?', 'Rules that evaluate resource configurations and can deny non-compliant ones, such as deployments outside approved regions.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-azure-for-governance-compliance/'),
+  ('9c48dd3a-aaaa-5639-bb33-2c1563166f58', 'governance-compliance', 'CanNotDelete vs ReadOnly locks', 'CanNotDelete prevents deletion but allows changes. ReadOnly prevents both changes and deletion.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-azure-for-governance-compliance/'),
+  ('75f63946-33d8-5e03-b6cf-ae6eeca80d36', 'governance-compliance', 'What is Microsoft Purview for?', 'Data governance: discovering, classifying and managing data across on-premises, multicloud and SaaS sources.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-azure-for-governance-compliance/'),
+  ('40e2fbd0-352f-5fc9-bac1-5e0b8c96c979', 'management-deployment', 'What is Azure Resource Manager?', 'The management layer every Azure request passes through, whether it comes from the portal, CLI, PowerShell, SDKs or templates.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-manage-deploy-azure-resources/'),
+  ('d37421df-582a-5f6d-bd4a-27b73d2ef209', 'management-deployment', 'What is infrastructure as code?', 'Defining infrastructure in files, such as ARM templates, so deployments are repeatable and can be reviewed.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-manage-deploy-azure-resources/'),
+  ('a4fb539e-8f9c-59e4-92cb-912ff6fd722e', 'management-deployment', 'What is Azure Arc for?', 'Managing servers and Kubernetes clusters outside Azure with Azure''s management and governance tools.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-features-tools-manage-deploy-azure-resources/'),
+  ('3800ceab-1849-562f-b651-6be4a59b3add', 'monitoring', 'What is Azure Service Health?', 'A personalised view of Azure service issues, planned maintenance and advisories for the services and regions you use.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-monitoring-tools-azure/'),
+  ('560c4caf-1f11-5536-b107-9562caae53c0', 'monitoring', 'What is Azure Advisor?', 'Personalised recommendations on reliability, security, performance, cost and operational excellence.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-monitoring-tools-azure/'),
+  ('9acc3552-6ec4-5f76-9b49-dbc78ceae290', 'monitoring', 'What is Azure Monitor?', 'Collects metrics and logs from resources. Log Analytics queries the logs, and alerts notify you when conditions are met.', null, 'https://learn.microsoft.com/en-us/training/modules/describe-monitoring-tools-azure/')
+) as v(id, subtopic_slug, front, back, example, reference_url)
+join public.subtopics s on s.slug = v.subtopic_slug
+on conflict (id) do update set
+  subtopic_id = excluded.subtopic_id, front = excluded.front, back = excluded.back,
+  example = excluded.example, reference_url = excluded.reference_url, is_published = true;
+
+update public.flashcards set is_published = false
+ where is_published and id <> all(array['29f10900-c2b4-5352-ae3e-9ca981fdd835', '844039d8-d2cc-54fd-b54b-1dd793eb2afc', '6da1a972-7954-5d65-bb31-4ea4777c5885', '67fe80f8-3636-5c58-a76b-89e8fb4b336b', 'fa9a5c25-ca85-55df-aed1-d69d96b972a7', 'fd8036fa-468e-514e-90b6-993ec7b9421e', '77a3c118-a78e-5233-803f-89d4298352e9', '35974b62-4f15-5d63-b83b-b876ac2e3211', '9ab92473-c34b-5eb2-8f88-608173c815ec', '022c4b5c-c6ff-55f9-8069-bfa238efbe08', '54c2f96d-9a97-582e-b5fa-d9d7c0a4643e', 'b2dd5828-b817-52e1-b4ec-d6a2fec30924', '35000e20-96e6-5cd9-bd9e-574017e95f18', 'a42e7778-e8eb-5ff5-92b9-50cbe1bd41c8', 'cf0c89e6-bdfb-5862-b14e-1c0abf40e0b0', '0e5ed972-ab74-5096-8972-df3c219d9d60', '4ff58d0c-0981-5891-b896-44c622b81ee6', 'ddfb91b5-5f39-58b9-8fce-f7c901400b7b', '4fbf134a-a70e-5af5-9826-da5db10956a9', 'dbf909de-6d4c-5464-8900-c2e6ec5c21bd', '9a658799-9169-59ea-9766-479be03ae12d', '8e5f3c42-d07d-5bc9-aa76-5f946426b52e', '32a740d4-8605-50e5-82f9-4c82d77f5534', '86f3859d-2149-5f26-9817-babae192d861', '2c629a3d-74ee-5838-86ba-8cc5420a542c', '89ef4dc9-e424-5848-a6cb-b4f4284c2c8b', '01a5a48c-0d3d-5fb4-a075-ab27db745d13', 'cb7d561b-1959-5ffc-93e0-e44c49da22c5', '717c4c95-b7ab-5b33-a0c2-e44b3c897678', '9c48dd3a-aaaa-5639-bb33-2c1563166f58', '75f63946-33d8-5e03-b6cf-ae6eeca80d36', '40e2fbd0-352f-5fc9-bac1-5e0b8c96c979', 'd37421df-582a-5f6d-bd4a-27b73d2ef209', 'a4fb539e-8f9c-59e4-92cb-912ff6fd722e', '3800ceab-1849-562f-b651-6be4a59b3add', '560c4caf-1f11-5536-b107-9562caae53c0', '9acc3552-6ec4-5f76-9b49-dbc78ceae290']::uuid[]);
 
 commit;
